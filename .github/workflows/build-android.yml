@@ -1,0 +1,153 @@
+name: Build Android APK
+
+# 放在你自己 fork 的仓库里：.github/workflows/build-android.yml
+# 触发方式：仓库 Actions 页面 -> 左侧 "Build Android APK" -> Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "构建类型（debug 已签名可直接安装；release 会额外自动签名）"
+        required: true
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/build-android.yml"
+
+jobs:
+  android:
+    name: Android (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            name: arm64-v8a
+          - target: armv7-linux-androideabi
+            name: armeabi-v7a
+          - target: x86_64-linux-android
+            name: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- 环境准备 ----------
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev pkg-config build-essential
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust 与 Android 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: 安装 Android SDK / NDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 NDK 与 build-tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "ndk;27.0.12077973" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      # ---------- 兼容上游配置的坑 ----------
+      # 1) tauri.conf.json 的 beforeBuildCommand 写成了 `pnp build`（拼写错误），软链到 pnpm
+      # 2) 清掉 CI 代理变量，避免 reqwest 的 system-proxy 在运行时误走代理
+      - name: 兼容上游 pnp 笔误 & 清代理
+        run: |
+          sudo ln -sf "$(command -v pnpm)" /usr/local/bin/pnp
+          unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 初始化 Android 工程（只在不存在时执行）
+        run: |
+          if [ ! -d src-tauri/gen/android ]; then
+            pnpm tauri android init --ci
+          else
+            echo "gen/android 已存在，跳过 init"
+          fi
+
+      # ---------- 构建 ----------
+      - name: 编译 APK
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          pnpm tauri android build --target ${{ matrix.target }} --apk --$BUILD_TYPE
+
+      # release 产物是 -unsigned.apk，需要手动签名才能安装
+      - name: 签名 release APK
+        if: ${{ github.event.inputs.build_type == 'release' }}
+        run: |
+          BT=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -type d | sort -V | tail -1)
+          export PATH="$BT:$PATH"
+          keytool -genkeypair -v -keystore /tmp/hghub.keystore \
+            -alias hghub -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass hghub123 -keypass hghub123 \
+            -dname "CN=HGhub, OU=Dev, O=HGhub, L=NA, ST=NA, C=US" 2>/dev/null || true
+          for f in $(find src-tauri/gen/android -name '*-unsigned.apk' -type f); do
+            echo "== 签名: $f"
+            zipalign -f 4 "$f" /tmp/aligned.apk
+            out="${f%-unsigned.apk}.apk"
+            apksigner sign --ks /tmp/hghub.keystore \
+              --ks-pass pass:hghub123 --key-pass pass:hghub123 \
+              --out "$out" /tmp/aligned.apk
+            rm -f "$f"
+          done
+
+      - name: 收集产物
+        run: |
+          mkdir -p dist-apk
+          i=0
+          for f in $(find src-tauri/gen/android -name '*.apk' -type f ! -name '*-unsigned.apk'); do
+            i=$((i+1))
+            cp "$f" "dist-apk/HGhub-${{ matrix.name }}-${i}.apk"
+            echo "== 产物: $f"
+          done
+          ls -lh dist-apk/
+          if [ "$i" -eq 0 ]; then
+            echo "::error::没有找到可安装的 APK，请检查上面的编译日志"
+            exit 1
+          fi
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-android-${{ matrix.name }}
+          path: dist-apk/*.apk
+          if-no-files-found: error
+          retention-days: 7
